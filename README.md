@@ -4,6 +4,8 @@ Static analysis, auto-refactoring, structural diff, and MCP server for Python pr
 
 > **Vision:** Everything in this project is designed for **humans to read, review, and understand code** — not for machines. Machines can parse anything; humans cannot. The bottleneck in software is always human comprehension. We build tools that make code **easy to see, easy to input, and easy to learn**.
 
+![](./ydiff.png)
+
 ## Why This Exists
 
 Code review is fundamentally a human activity. Yet most tools output walls of text that only machines love. We believe:
