@@ -813,6 +813,104 @@ async def health_score(project_dir: str) -> str:
             f"重组建议: {len(result.reorg_suggestions)} 条")
 
 
+@mcp.tool()
+async def auto_refactor(
+    project_dir: str,
+    apply: bool = False,
+    backup: bool = True,
+    file_only: bool = False,
+    func_only: bool = False,
+    max_func_lines: int = 30,
+    max_file_lines: int = 400,
+) -> str:
+    """Automatically refactor a Python project: split long functions, split large files, and reorganize by category.
+
+    In preview mode (apply=False), returns the refactoring plan without modifying any files.
+    In apply mode (apply=True), executes the refactoring and modifies/creates files.
+
+    Args:
+        project_dir: Absolute path to the Python project directory
+        apply: Whether to actually execute the refactoring (default: False, preview only)
+        backup: Whether to backup original files as .bak before modifying (default: True)
+        file_only: Only perform file splitting, skip function splitting (default: False)
+        func_only: Only perform function splitting, skip file splitting (default: False)
+        max_func_lines: Functions longer than this will be split (default: 30)
+        max_file_lines: Files longer than this will be split (default: 400)
+    """
+    path = Path(project_dir)
+    if not path.is_dir():
+        return f"Error: Directory does not exist: {project_dir}"
+
+    try:
+        from refactor_auto import (
+            analyze_project, apply_file_split, apply_func_split,
+            MAX_FUNC_LINES as _mfl, MAX_FILE_LINES as _mfll,
+        )
+        import refactor_auto
+        refactor_auto.MAX_FUNC_LINES = max_func_lines
+        refactor_auto.MAX_FILE_LINES = max_file_lines
+    except ImportError:
+        return ("Error: refactor_auto.py not found. "
+                "Please ensure it is in the same directory as refactor_mcp_server.py")
+
+    actions = analyze_project(project_dir)
+
+    if file_only:
+        actions = [a for a in actions if a.kind == "split_file"]
+    elif func_only:
+        actions = [a for a in actions if a.kind == "split_func"]
+
+    if not actions:
+        return "未发现需要重构的内容，代码结构良好！"
+
+    func_splits = [a for a in actions if a.kind == "split_func"]
+    file_splits = [a for a in actions if a.kind == "split_file"]
+
+    lines = [
+        f"=== 自动重构{'执行报告' if apply else '计划预览'} ===",
+        f"项目: {path.resolve()}",
+        f"函数拆分: {len(func_splits)} 个",
+        f"文件拆分: {len(file_splits)} 个",
+        f"总操作数: {len(actions)} 个",
+    ]
+
+    if func_splits:
+        lines.append(f"\n--- 函数拆分 ---")
+        for a in func_splits:
+            lines.append(f"\n{a.description}")
+            for d in a.details:
+                lines.append(f"  {d}")
+
+    if file_splits:
+        lines.append(f"\n--- 文件拆分 ---")
+        for a in file_splits:
+            lines.append(f"\n{a.description}")
+            for d in a.details:
+                lines.append(f"  {d}")
+
+    if apply:
+        lines.append(f"\n--- 执行结果 ---")
+        for a in file_splits:
+            try:
+                apply_file_split(a, project_dir, backup=backup)
+                lines.append(f"  [OK] {a.description}")
+            except Exception as e:
+                lines.append(f"  [FAIL] {a.description}: {e}")
+
+        for a in func_splits:
+            try:
+                apply_func_split(a, project_dir, backup=backup)
+                lines.append(f"  [OK] {a.description}")
+            except Exception as e:
+                lines.append(f"  [FAIL] {a.description}: {e}")
+
+        lines.append(f"\n重构完成！" + (" 原文件已备份为 .bak" if backup else ""))
+    else:
+        lines.append(f"\n提示: 设置 apply=True 执行重构")
+
+    return "\n".join(lines)
+
+
 # ─── HTML 报告生成 ─────────────────────────────────────────────────────────
 def _build_html_report(result: AnalysisResult, t: dict) -> str:
     severity_counts = {"high": 0, "medium": 0, "low": 0}
