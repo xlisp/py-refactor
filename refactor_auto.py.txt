@@ -551,33 +551,33 @@ def _analyze_file_for_split(
         elif isinstance(assign, ast.AnnAssign) and isinstance(assign.target, ast.Name):
             top_var_texts[assign.target.id] = text
 
-    # 收集所有顶层函数/类的源码文本 (用于复制到新文件，避免循环导入)
-    top_item_texts: dict[str, str] = {}
-    top_item_imports: dict[str, list[str]] = {}
+    # 收集所有顶层函数/类的完整信息 (用于移动到新文件，避免循环导入)
+    # top_item_info: name → (start_line_1based, end_line_1based, source_text, kind, imports)
+    top_item_info: dict[str, tuple[int, int, str, str, list[str]]] = {}
     for cls in classes:
         start = cls.lineno - 1
         if cls.decorator_list:
             start = cls.decorator_list[0].lineno - 1
         end = cls.end_lineno or cls.lineno
-        top_item_texts[cls.name] = "\n".join(lines[start:end])
         same_deps: set[str] = set()
-        top_item_imports[cls.name] = _find_needed_imports(
+        imps = _find_needed_imports(
             cls, import_nodes, lines,
             all_defined_names=all_defined_names,
             same_file_names_used=same_deps,
         )
+        top_item_info[cls.name] = (start + 1, end, "\n".join(lines[start:end]), "class", imps)
     for func in functions:
         start = func.lineno - 1
         if func.decorator_list:
             start = func.decorator_list[0].lineno - 1
         end = func.end_lineno or func.lineno
-        top_item_texts[func.name] = "\n".join(lines[start:end])
         same_deps: set[str] = set()
-        top_item_imports[func.name] = _find_needed_imports(
+        imps = _find_needed_imports(
             func, import_nodes, lines,
             all_defined_names=all_defined_names,
             same_file_names_used=same_deps,
         )
+        top_item_info[func.name] = (start + 1, end, "\n".join(lines[start:end]), "function", imps)
 
     new_modules: list[NewModule] = []
     all_moved_names: set[str] = set()
@@ -691,8 +691,7 @@ def _analyze_file_for_split(
         mod_name = mod.filename.replace(".py", "")
         extra_imports: set[str] = set()
         extra_var_defs: set[str] = set()
-
-        extra_copy_items: list[str] = []  # 需要复制源码的同文件定义名
+        extra_move_items: list[str] = []  # 需要一起移动的同文件定义名
 
         for item in mod.items:
             deps = cross_refs.get(item.name, set())
@@ -702,15 +701,11 @@ def _analyze_file_for_split(
                     if dep_module != mod_name:
                         extra_imports.add(f"from {dep_module} import {dep_name}")
                 elif dep_name in top_var_texts:
-                    # 依赖顶层常量/变量 → 复制定义到新文件
+                    # 依赖顶层常量/变量 → 复制定义到新文件（常量不删除，允许多处使用）
                     extra_var_defs.add(dep_name)
-                elif dep_name in top_item_texts:
-                    # 依赖未被移出的同文件函数/类 → 复制源码到新文件（避免循环导入）
-                    extra_copy_items.append(dep_name)
-                    # 同时需要把被复制项的 import 依赖也带上
-                    if dep_name in top_item_imports:
-                        for imp in top_item_imports[dep_name]:
-                            extra_imports.add(imp)
+                elif dep_name in top_item_info and dep_name not in all_moved_names:
+                    # 依赖未被移出的同文件函数/类 → 一起移动到新文件（避免循环导入）
+                    extra_move_items.append(dep_name)
 
         # 追加到 header_imports
         if extra_imports:
@@ -719,29 +714,42 @@ def _analyze_file_for_split(
                 if imp not in existing:
                     mod.header_imports.append(imp)
 
-        # 收集需要复制到新文件头部的代码 (常量 + 未移出的函数/类)
-        prefix_parts = []
+        # 复制常量定义到新文件
         if extra_var_defs:
-            for name in sorted(extra_var_defs):
-                if name in top_var_texts:
-                    prefix_parts.append(top_var_texts[name])
-        if extra_copy_items:
-            seen_copy = set()
-            for name in extra_copy_items:
-                if name not in seen_copy and name in top_item_texts:
-                    seen_copy.add(name)
-                    prefix_parts.append(top_item_texts[name])
+            var_parts = [top_var_texts[n] for n in sorted(extra_var_defs) if n in top_var_texts]
+            if var_parts and mod.items:
+                prefix_code = "\n\n\n".join(var_parts)
+                mod.items[0] = MovedItem(
+                    name=mod.items[0].name,
+                    kind=mod.items[0].kind,
+                    start_line=mod.items[0].start_line,
+                    end_line=mod.items[0].end_line,
+                    source_text=prefix_code + "\n\n\n" + mod.items[0].source_text,
+                    needed_imports=mod.items[0].needed_imports,
+                )
 
-        if prefix_parts and mod.items:
-            prefix_code = "\n\n\n".join(prefix_parts)
-            mod.items[0] = MovedItem(
-                name=mod.items[0].name,
-                kind=mod.items[0].kind,
-                start_line=mod.items[0].start_line,
-                end_line=mod.items[0].end_line,
-                source_text=prefix_code + "\n\n\n" + mod.items[0].source_text,
-                needed_imports=mod.items[0].needed_imports,
-            )
+        # 将依赖的函数/类作为正式 MovedItem 加入模块（移动而非复制）
+        seen_move = set()
+        for dep_name in extra_move_items:
+            if dep_name in seen_move or dep_name in all_moved_names:
+                continue
+            seen_move.add(dep_name)
+            info = top_item_info[dep_name]
+            start_line, end_line, source_text, kind, dep_imports = info
+            # 把被移动项的 import 依赖也带上
+            for imp in dep_imports:
+                if imp not in set(mod.header_imports):
+                    mod.header_imports.append(imp)
+            mod.items.append(MovedItem(
+                name=dep_name,
+                kind=kind,
+                start_line=start_line,
+                end_line=end_line,
+                source_text=source_text,
+                needed_imports=dep_imports,
+            ))
+            all_moved_names.add(dep_name)
+            name_to_module[dep_name] = mod_name
 
     # 原文件中需要添加的 import (不带点号，直接 from module import ...)
     remaining_imports = []
